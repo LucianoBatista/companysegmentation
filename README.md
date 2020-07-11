@@ -6,7 +6,7 @@ You will be using stock prices in this analysis. You come up with a method to cl
 
 # Objectives
 
-Apply your knowledge on K-Means and UMAP along with `dplyr`, `ggplot2`, and `purrr` to create a visualization that identifies subgroups in the S&P 500 Index. You will specifically apply:
+Apply your knowledge on K-Means and UMAP along with `dplyr`, `ggplot2`, and `purrr` to create a visualization that identifies subgroups in the group of brazilian companies. You will specifically apply:
 
 - Modeling: `kmeans()` and `umap()`
 - Iteration: `purrr`
