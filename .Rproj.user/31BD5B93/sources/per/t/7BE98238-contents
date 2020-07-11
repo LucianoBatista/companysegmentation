@@ -1,0 +1,318 @@
+---
+title: "Week 6 - Challenge - Company Segmentation"
+author: "Luciano O. Batista"
+date: "11/07/2020"
+output: 
+    html_document:
+        toc: TRUE
+        theme: flatly
+        highlight: tango
+        code_folding: hide
+        df_print: paged
+---
+
+# Libraries
+
+```{r}
+library(tidyverse)
+library(tidyquant)
+library(broom)
+library(umap)
+library(plotly)
+library(BatchGetSymbols)
+```
+
+# Data from B3
+
+```{r}
+# # set tickers
+# ibov <- GetIbovStocks()
+# tickers <- paste0(ibov$tickers, ".SA") # ex: ABEV3.SA
+# 
+# # JUST EXECUTE THESE CODES IF YOU WANT TO DOWNLOAD ALL THE DATA AGAIN
+# # set dates and other inputs
+# first.date <- Sys.Date()-3650 # the last 10 years
+# last.date <- Sys.Date()
+# thresh.bad.data <- 0.95   # sets percent threshold for bad data
+# bench.ticker <- '^BVSP'   # set benchmark as ibovespa
+# cache.folder <- 'data' # set folder for cache
+# 
+# l.out <- BatchGetSymbols(tickers = tickers,
+#                          first.date = first.date,
+#                          last.date = last.date,
+#                          bench.ticker = bench.ticker,
+#                          thresh.bad.data = thresh.bad.data,
+#                          cache.folder = cache.folder)
+# 
+# brazillian_stocks <- l.out$df.tickers %>% as_tibble()
+# 
+# brazillian_stocks_tbl <- brazillian_stocks %>% 
+#     select(ticker, everything())
+# 
+# # saving the data
+# brazillian_stocks_tbl %>% write_rds(path = "data/brazillian_stocks_tbl.rds")
+```
+
+## Load Data from directory
+
+```{r}
+brazillian_stocks_tbl <- read_rds("data/brazillian_stocks_tbl.rds")
+
+# the code has managed to collect the data from 54 companies
+brazillian_stocks_tbl %>%
+    distinct(ticker)
+```
+
+Mais tarde iremos precisar de informações sobre setor e subsetor das empresas que coletamos. Dessa forma será mais fácil interpretar a segmentação do algorítmo.
+
+```{r}
+# this code get the tickers for 75 Brazilian companies
+ibov <- GetIbovStocks()
+ibov_tbl <- ibov %>% as_tibble()
+# selecting just what we need from ibov_tbl
+ibov_tickers_tbl <- ibov_tbl %>% 
+    select(tickers, ticker.desc)
+
+# this csv contains information about sector and subsector from some companies
+ibov_sector_subsector <- read_csv("data/tickers_sector.csv")
+
+ibov_sector_subsector <- ibov_sector_subsector %>% 
+    mutate(ticker = ticker %>% str_remove_all(".SA"))
+
+ibov_tickers_desc <- ibov_tickers_tbl %>% 
+    semi_join(ibov_sector_subsector, by = c("tickers"="ticker")) %>% 
+    left_join(ibov_sector_subsector, by = c("tickers"="ticker"))
+
+```
+
+Até agora temos os dados na tebela `brazillian_stocks_tbl` e também uma tabela com informações de setores e subsetores dessas empresas.
+
+## Step 1 - Convert stock prices to a standardized format (daily returns)
+
+Agora, de forma a comparar os dados, precisamos que ele esteja em uma forma normalizada ou padronizada. Por quê? Justamente por que não podemos comparar valores de cotação que apresentam um intervalo muito maior para os diferentes tipos de ação.
+
+Dito isso, utilizarei o daily returns para padronizar os dados, que nada mais é do que a porcentagem de quanto aumentou ou diminuiu o preço da ação, de um dia para outro. Veja, essa é uma etapa muito importante do processo, e que você pode aplicar a padronização que mais faz sentido para os seus dados. Veja como isso foi feito nos meus dados.
+
+$$ 
+return_{daily} = \frac{price_{i}-price_{i-1}}{price_{i-1}}
+$$
+
+```{r}
+brazilian_stocks_return_tbl <- brazillian_stocks_tbl %>% 
+    select(ticker, ref.date, price.adjusted) %>% 
+    group_by(ticker) %>% 
+    mutate(lag = lag(price.adjusted),
+           lag = case_when(
+               is.na(lag) ~ price.adjusted,
+               TRUE ~ lag
+           )) %>% 
+    mutate(diff_lag = price.adjusted - lag,
+           pct_return = diff_lag/lag) %>% 
+    ungroup() %>% 
+    select(ticker, ref.date, pct_return)
+
+```
+
+
+## Step 2 - Convert to User-Item Format
+
+Essa etapa, apesar de simples é fundamental para que o algoritmo funcione corretamente. Esse formato 'user-item' ao mesmo tempo que é um formato melhor de se visualizar a informação, já que cada linha contêm as informações de uma empresa, é contra intuitivo do ponto de vista de análise de dados. 
+
+Mas por que usar esse formato? Por ser o formato que o algoritmo recebe a informação. Nessa etapa entra o seu conhecimento sobre a implementação do modelo, que pode ser facilmente encontrado na documentação (nossa grande amiga).
+
+```{r}
+# Dropping all the missing values by row
+brazilian_stocks_return_wna_tbl <- brazilian_stocks_return_tbl %>% 
+    drop_na()
+
+# Converting to user-item format
+br_stock_user_mtx_tbl <-  brazilian_stocks_return_wna_tbl %>% 
+    pivot_wider(ticker, 
+                values_from = pct_return, 
+                names_from = ref.date, 
+                values_fill = 0)
+
+```
+
+
+## Step 3 - Perform K-Means Clustering
+
+Em função de obter a melhor performance com o algoritmo Kmeans, nós precisamos encontrar o melhor valor para k (número de clusters). Para isso utilizei o método do elbow (cotovelo).
+
+Aqui é onde, na minha opnião, está uma das melhores features do R, a possibilidade de trabalhar diferentes tipos de dados aninhados dentro de um dataframe. E, integrando esse característica com as funcionalidades do pacote purrr, é como se você ganhasse superpoderes.
+
+Veja abaixo como eu treinei 30 modelos de kmeans, para cada k diferente, e armazenei todo o resultado numa coluna chamada k_means. Em conjunto apliquei o glance em uma nova coluna e o augment em outra. O glance e augment são funções do pacote broom, e servem para extrair informações de resultados de alguns algorítimos.
+
+
+```{r}
+kmeans_mapper <- function(center = 3) {
+    br_stock_user_mtx_tbl %>%
+        select(-ticker) %>%
+        kmeans(centers = center, nstart = 20)
+}
+```
+
+
+```{r}
+set.seed(123)
+k_means_mapped_tbl <- tibble(centers = 1:30) %>%
+    mutate(k_means = centers %>% map(kmeans_mapper)) %>% 
+    mutate(glance = k_means %>% map(glance),
+           augment = k_means %>% map(augment, br_stock_user_mtx_tbl))
+
+```
+
+
+```{r}
+# Visualize Scree Plot
+k_means_mapped_tbl %>% 
+    unnest(glance) %>% 
+    ggplot(aes(x = centers,
+               y = tot.withinss)) +
+    geom_point(aes(color = centers %>% between(6, 10)), size = 3) +
+    geom_line(color = "gray60") +
+    ggrepel::geom_label_repel(aes(label = centers,
+                                  color = centers %>% between(6, 10),
+                                  fill = centers %>% between(6, 10))) +
+    scale_color_manual(values = c("gray60", "gray30")) +
+    scale_fill_manual(values = c("white", "gray80")) +
+    theme_tq(base_family = "IBM Plex Sans") +
+    labs(
+        title = "Elbow Method",
+        subtitle = "The best clusters that we should try",
+        caption = "github/LucianoBatista",
+        x = "Centers",
+        y = "Total Within Sum of Squares"
+    ) +
+    guides(color = FALSE,
+           fill = FALSE) +
+    theme(
+        
+        plot.title = element_text(face = "bold", size = rel(2))
+    )
+
+
+```
+
+## Step 5 - Apply UMAP
+
+Aqui apliquei o UMAP, que é uma técnica de redução de dimensionalidade, e vai buscar explicar essa matriz no formato 'user-item' em menos dimensões (colunas), e irá nos permitir visualizar as informações em duas dimensões.
+
+```{r}
+# Apply UMAP
+set.seed(123)
+umap_results <- br_stock_user_mtx_tbl %>% 
+    select(-ticker) %>% 
+    umap()
+
+```
+
+
+
+```{r}
+# Applying UMAP
+set.seed(123)
+umap_results <- br_stock_user_mtx_tbl %>% 
+    select(-ticker) %>% 
+    umap()
+
+# Convert UMAP results to tibble with tickers
+umap_results_tbl <- umap_results$layout %>% 
+    as_tibble() %>% 
+    set_names(c("C1", "C2")) %>% 
+    bind_cols(
+        ticker = br_stock_user_mtx_tbl %>% select(ticker)
+    )
+
+# Output: umap_results_tbl
+```
+
+```{r}
+# Visualize UMAP results
+umap_results_tbl %>% 
+    ggplot(aes(x = C1,
+               y = C2)) +
+    geom_point(alpha = .5) +
+    theme_tq()
+
+
+```
+
+## Step 6 - Combine K-Means and UMAP
+
+```{r}
+# join both methods
+umap_kmeans_results_tbl <- k_means_mapped_tbl %>% 
+    filter(centers == 10) %>% 
+    unnest(augment) %>% 
+    # dropping these columns
+    select(-c(centers, k_means, glance)) %>%
+    # company and the respective cluster
+    select(ticker, .cluster) %>% 
+    # join with the company sector information
+    left_join(umap_results_tbl) %>% 
+    mutate(ticker = ticker %>% str_replace_all(".SA", "")) %>% 
+    left_join(ibov_tickers_desc %>% select(tickers, ticker.desc, setor, subsetor),
+              by = c("ticker"="tickers"))
+
+```
+
+```{r}
+# Visualize the combined K-Means and UMAP results
+umap_kmeans_results_tbl %>% 
+    ggplot(aes(x = C1,
+               y = C2,
+               color = .cluster)) +
+    geom_point(alpha = .5) +
+    theme_tq()
+
+```
+
+Estamos chegando ao fim!! Aqui utilizei interatividade no gráfico dos clusters, pois acredito que esse tipo de análise é muito mais beneficiada quando o usuário pode investigar por si mesmo as informações.
+
+Então, no código abaixo você encontra as funções que permitiram a construção do gráfico interativo e um breve vídeo com a interação.
+
+# Interactivity
+
+```{r}
+get_kmeans <- function(k = 3) {
+    
+    umap_kmeans_results_tbl <- k_means_mapped_tbl %>% 
+        filter(centers == 10) %>% 
+        unnest(augment) %>% 
+        select(-c(centers, k_means, glance)) %>%
+        select(ticker, .cluster) %>% 
+        left_join(umap_results_tbl) %>% 
+        mutate(ticker = ticker %>% str_replace_all(".SA", "")) %>% 
+        left_join(ibov_tickers_desc %>% select(tickers, ticker.desc, setor, subsetor),
+                  by = c("ticker"="tickers"))
+    
+    return(umap_kmeans_results_tbl)
+}
+
+plot_cluster <- function(k = 3) {
+    
+    g <- get_kmeans(k) %>%
+        
+        mutate(label_text = str_glue("Stock: {ticker}
+                                     Company: {ticker.desc}
+                                     Sector: {setor}
+                                     Subsetor: {subsetor}")) %>%
+        
+        ggplot(aes(C1, C2, color = .cluster, text = label_text)) +
+        geom_point(size = 3) +
+        theme_tq() +
+        scale_color_manual(values = c("#00798c", "#d1495b", "#edae49", "#66a182", "#2e4057", "#8d96a3", "darkorange1", "blue", "green", "pink"))
+    
+    g %>%
+        ggplotly(tooltip = "text")
+    
+}
+
+# choose how many clusters you want to see
+plot_cluster(k = 10)
+```
+
+
+
+
